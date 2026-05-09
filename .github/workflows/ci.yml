@@ -1,0 +1,1664 @@
+name: Synetra CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global env shared across all jobs
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  NODE_VERSION: "20"
+  MONGO_URI: mongodb://localhost:27017/synetra_test
+  JWT_SECRET: ci_test_secret_do_not_use_in_prod
+  PORT: 5000
+  CLIENT_URL: http://localhost:3000
+  VITE_API_URL: http://localhost:5000
+  VITE_SOCKET_URL: http://localhost:5000
+  VITE_GRAPHQL_URL: http://localhost:5000/graphql
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 — Lint (fast gate, runs in parallel with everything else)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  lint:
+    name: 🔍 ESLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run ESLint
+        working-directory: frontend
+        run: npx eslint . --ext js,jsx --max-warnings 0
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Backend unit + integration tests (Jest + Supertest + MongoDB Memory)
+  # ───────────────────────────────────────────────────────────────────────────
+  backend-tests:
+    name: 🧪 Backend — Jest (unit + integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      # Install test deps that don't exist yet in the project.
+      # We install them into the backend directly so tests can run.
+      - name: Install backend deps + test tooling
+        working-directory: backend
+        run: |
+          npm ci
+          npm install --save-dev \
+            jest \
+            supertest \
+            mongodb-memory-server \
+            @jest/globals \
+            cross-env
+
+      # Write jest config inline so we don't need a committed jest.config.js
+      - name: Write jest.config.cjs
+        working-directory: backend
+        run: |
+          cat > jest.config.cjs << 'EOF'
+          module.exports = {
+            testEnvironment: 'node',
+            testMatch: ['**/__tests__/**/*.test.js'],
+            forceExit: true,
+            detectOpenHandles: true,
+            testTimeout: 30000,
+            coverageDirectory: 'coverage',
+            collectCoverageFrom: [
+              'routes/**/*.js',
+              'socket/**/*.js',
+              'middleware/**/*.js',
+              'models/**/*.js',
+              '!**/node_modules/**',
+            ],
+          };
+          EOF
+
+      # ── Write the actual test files ────────────────────────────────────────
+
+      - name: Write test helpers
+        working-directory: backend
+        run: |
+          mkdir -p __tests__/helpers
+          cat > __tests__/helpers/db.js << 'EOF'
+          const { MongoMemoryServer } = require('mongodb-memory-server');
+          const mongoose = require('mongoose');
+
+          let mongod;
+
+          async function connect() {
+            mongod = await MongoMemoryServer.create();
+            await mongoose.connect(mongod.getUri());
+          }
+
+          async function closeDatabase() {
+            await mongoose.connection.dropDatabase();
+            await mongoose.connection.close();
+            await mongod.stop();
+          }
+
+          async function clearDatabase() {
+            const collections = mongoose.connection.collections;
+            for (const key in collections) {
+              await collections[key].deleteMany({});
+            }
+          }
+
+          module.exports = { connect, closeDatabase, clearDatabase };
+          EOF
+
+          cat > __tests__/helpers/auth.js << 'EOF'
+          const jwt = require('jsonwebtoken');
+          const User = require('../../models/User');
+
+          async function createUser(overrides = {}) {
+            const user = await User.create({
+              name: overrides.name || 'Test User',
+              email: overrides.email || `test_${Date.now()}@example.com`,
+              password: overrides.password || 'password123',
+            });
+            return user;
+          }
+
+          function tokenFor(userId) {
+            return jwt.sign({ userId: userId.toString() }, process.env.JWT_SECRET || 'ci_test_secret_do_not_use_in_prod', {
+              expiresIn: '1d',
+            });
+          }
+
+          module.exports = { createUser, tokenFor };
+          EOF
+
+      - name: Write auth route tests
+        working-directory: backend
+        run: |
+          cat > __tests__/auth.test.js << 'EOF'
+          const request = require('supertest');
+          const express = require('express');
+          const { connect, closeDatabase, clearDatabase } = require('./helpers/db');
+          const authRoutes = require('../routes/auth');
+
+          const app = express();
+          app.use(express.json());
+          app.use('/api/auth', authRoutes);
+
+          beforeAll(() => connect());
+          afterEach(() => clearDatabase());
+          afterAll(() => closeDatabase());
+
+          describe('POST /api/auth/register', () => {
+            it('registers a new user and returns a token', async () => {
+              const res = await request(app).post('/api/auth/register').send({
+                name: 'Alice',
+                email: 'alice@example.com',
+                password: 'secret123',
+              });
+              expect(res.status).toBe(201);
+              expect(res.body.token).toBeDefined();
+              expect(res.body.user.email).toBe('alice@example.com');
+              expect(res.body.user.password).toBeUndefined();
+            });
+
+            it('rejects duplicate email', async () => {
+              const payload = { name: 'Bob', email: 'bob@example.com', password: 'pass123' };
+              await request(app).post('/api/auth/register').send(payload);
+              const res = await request(app).post('/api/auth/register').send(payload);
+              expect(res.status).toBe(400);
+              expect(res.body.message).toMatch(/already exists/i);
+            });
+
+            it('rejects missing name', async () => {
+              const res = await request(app).post('/api/auth/register').send({
+                email: 'no@name.com',
+                password: 'pass123',
+              });
+              expect(res.status).toBe(400);
+            });
+
+            it('rejects invalid email', async () => {
+              const res = await request(app).post('/api/auth/register').send({
+                name: 'Bad',
+                email: 'not-an-email',
+                password: 'pass123',
+              });
+              expect(res.status).toBe(400);
+            });
+
+            it('rejects short password', async () => {
+              const res = await request(app).post('/api/auth/register').send({
+                name: 'Short',
+                email: 'short@pass.com',
+                password: '123',
+              });
+              expect(res.status).toBe(400);
+            });
+          });
+
+          describe('POST /api/auth/login', () => {
+            beforeEach(async () => {
+              await request(app).post('/api/auth/register').send({
+                name: 'Carol',
+                email: 'carol@example.com',
+                password: 'mypassword',
+              });
+            });
+
+            it('logs in with valid credentials', async () => {
+              const res = await request(app).post('/api/auth/login').send({
+                email: 'carol@example.com',
+                password: 'mypassword',
+              });
+              expect(res.status).toBe(200);
+              expect(res.body.token).toBeDefined();
+              expect(res.body.user.email).toBe('carol@example.com');
+            });
+
+            it('rejects wrong password', async () => {
+              const res = await request(app).post('/api/auth/login').send({
+                email: 'carol@example.com',
+                password: 'wrongpassword',
+              });
+              expect(res.status).toBe(400);
+              expect(res.body.message).toMatch(/invalid credentials/i);
+            });
+
+            it('rejects unknown email', async () => {
+              const res = await request(app).post('/api/auth/login').send({
+                email: 'nobody@example.com',
+                password: 'pass123',
+              });
+              expect(res.status).toBe(400);
+            });
+          });
+
+          describe('GET /api/auth/me', () => {
+            it('returns current user for valid token', async () => {
+              const reg = await request(app).post('/api/auth/register').send({
+                name: 'Dave',
+                email: 'dave@example.com',
+                password: 'pass1234',
+              });
+              const { token } = reg.body;
+              const res = await request(app)
+                .get('/api/auth/me')
+                .set('Authorization', `Bearer ${token}`);
+              expect(res.status).toBe(200);
+              expect(res.body.user.email).toBe('dave@example.com');
+            });
+
+            it('returns 401 with no token', async () => {
+              const res = await request(app).get('/api/auth/me');
+              expect(res.status).toBe(401);
+            });
+
+            it('returns 401 with invalid token', async () => {
+              const res = await request(app)
+                .get('/api/auth/me')
+                .set('Authorization', 'Bearer invalidtoken');
+              expect(res.status).toBe(401);
+            });
+          });
+          EOF
+
+      - name: Write document route tests
+        working-directory: backend
+        run: |
+          cat > __tests__/document.test.js << 'EOF'
+          const request = require('supertest');
+          const express = require('express');
+          const { connect, closeDatabase, clearDatabase } = require('./helpers/db');
+          const { createUser, tokenFor } = require('./helpers/auth');
+          const documentRoutes = require('../routes/document');
+
+          const app = express();
+          app.use(express.json());
+          app.use('/api/documents', documentRoutes);
+
+          beforeAll(() => connect());
+          afterEach(() => clearDatabase());
+          afterAll(() => closeDatabase());
+
+          describe('POST /api/documents', () => {
+            it('creates a document for authenticated user', async () => {
+              const user = await createUser();
+              const token = tokenFor(user._id);
+              const res = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${token}`)
+                .send({ title: 'My Doc' });
+              expect(res.status).toBe(201);
+              expect(res.body.document.title).toBe('My Doc');
+              expect(res.body.document.owner._id.toString()).toBe(user._id.toString());
+            });
+
+            it('creates with default title if none provided', async () => {
+              const user = await createUser();
+              const token = tokenFor(user._id);
+              const res = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${token}`)
+                .send({});
+              expect(res.status).toBe(201);
+              expect(res.body.document.title).toBe('Untitled Document');
+            });
+
+            it('returns 401 without auth', async () => {
+              const res = await request(app).post('/api/documents').send({ title: 'No auth' });
+              expect(res.status).toBe(401);
+            });
+          });
+
+          describe('GET /api/documents', () => {
+            it('returns documents owned by user', async () => {
+              const user = await createUser();
+              const token = tokenFor(user._id);
+              await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${token}`)
+                .send({ title: 'Doc A' });
+              const res = await request(app)
+                .get('/api/documents')
+                .set('Authorization', `Bearer ${token}`);
+              expect(res.status).toBe(200);
+              expect(res.body.documents.length).toBe(1);
+              expect(res.body.documents[0].title).toBe('Doc A');
+            });
+
+            it('does not return other users documents', async () => {
+              const owner = await createUser({ email: 'owner@test.com' });
+              const other = await createUser({ email: 'other@test.com' });
+              await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ title: 'Private' });
+              const res = await request(app)
+                .get('/api/documents')
+                .set('Authorization', `Bearer ${tokenFor(other._id)}`);
+              expect(res.status).toBe(200);
+              expect(res.body.documents.length).toBe(0);
+            });
+          });
+
+          describe('GET /api/documents/:id', () => {
+            it('returns a document the user owns', async () => {
+              const user = await createUser();
+              const token = tokenFor(user._id);
+              const created = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${token}`)
+                .send({ title: 'Fetchable' });
+              const docId = created.body.document._id;
+              const res = await request(app)
+                .get(`/api/documents/${docId}`)
+                .set('Authorization', `Bearer ${token}`);
+              expect(res.status).toBe(200);
+              expect(res.body.document._id).toBe(docId);
+            });
+
+            it('returns 403 for unauthorized user', async () => {
+              const owner = await createUser({ email: 'o@test.com' });
+              const stranger = await createUser({ email: 's@test.com' });
+              const created = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ title: 'Secret' });
+              const docId = created.body.document._id;
+              const res = await request(app)
+                .get(`/api/documents/${docId}`)
+                .set('Authorization', `Bearer ${tokenFor(stranger._id)}`);
+              expect(res.status).toBe(403);
+            });
+
+            it('returns 404 for nonexistent document', async () => {
+              const user = await createUser();
+              const res = await request(app)
+                .get('/api/documents/000000000000000000000000')
+                .set('Authorization', `Bearer ${tokenFor(user._id)}`);
+              expect(res.status).toBe(404);
+            });
+          });
+
+          describe('PUT /api/documents/:id', () => {
+            it('owner can update title and content', async () => {
+              const user = await createUser();
+              const token = tokenFor(user._id);
+              const created = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${token}`)
+                .send({ title: 'Original' });
+              const docId = created.body.document._id;
+              const res = await request(app)
+                .put(`/api/documents/${docId}`)
+                .set('Authorization', `Bearer ${token}`)
+                .send({ title: 'Updated', content: '<p>Hello</p>' });
+              expect(res.status).toBe(200);
+              expect(res.body.document.title).toBe('Updated');
+              expect(res.body.document.content).toBe('<p>Hello</p>');
+            });
+
+            it('non-owner without permission cannot update', async () => {
+              const owner = await createUser({ email: 'own@test.com' });
+              const other = await createUser({ email: 'oth@test.com' });
+              const created = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ title: 'Protected' });
+              const docId = created.body.document._id;
+              const res = await request(app)
+                .put(`/api/documents/${docId}`)
+                .set('Authorization', `Bearer ${tokenFor(other._id)}`)
+                .send({ title: 'Hacked' });
+              expect(res.status).toBe(403);
+            });
+          });
+
+          describe('DELETE /api/documents/:id', () => {
+            it('owner can delete their document', async () => {
+              const user = await createUser();
+              const token = tokenFor(user._id);
+              const created = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${token}`)
+                .send({ title: 'To Delete' });
+              const docId = created.body.document._id;
+              const res = await request(app)
+                .delete(`/api/documents/${docId}`)
+                .set('Authorization', `Bearer ${token}`);
+              expect(res.status).toBe(200);
+            });
+
+            it('non-owner cannot delete', async () => {
+              const owner = await createUser({ email: 'del_o@test.com' });
+              const other = await createUser({ email: 'del_x@test.com' });
+              const created = await request(app)
+                .post('/api/documents')
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ title: 'Owned' });
+              const docId = created.body.document._id;
+              const res = await request(app)
+                .delete(`/api/documents/${docId}`)
+                .set('Authorization', `Bearer ${tokenFor(other._id)}`);
+              expect(res.status).toBe(403);
+            });
+          });
+          EOF
+
+      - name: Write share route tests
+        working-directory: backend
+        run: |
+          cat > __tests__/share.test.js << 'EOF'
+          const request = require('supertest');
+          const express = require('express');
+          const { connect, closeDatabase, clearDatabase } = require('./helpers/db');
+          const { createUser, tokenFor } = require('./helpers/auth');
+          const documentRoutes = require('../routes/document');
+          const shareRoutes = require('../routes/share');
+
+          const app = express();
+          app.use(express.json());
+          app.use('/api/documents', documentRoutes);
+          app.use('/api/share', shareRoutes);
+
+          beforeAll(() => connect());
+          afterEach(() => clearDatabase());
+          afterAll(() => closeDatabase());
+
+          async function createDoc(token, title = 'Shared Doc') {
+            const res = await request(app)
+              .post('/api/documents')
+              .set('Authorization', `Bearer ${token}`)
+              .send({ title });
+            return res.body.document;
+          }
+
+          describe('POST /api/share/:documentId', () => {
+            it('owner can share document with another user', async () => {
+              const owner = await createUser({ email: 'shr_own@t.com' });
+              const recipient = await createUser({ email: 'shr_rec@t.com' });
+              const doc = await createDoc(tokenFor(owner._id));
+              const res = await request(app)
+                .post(`/api/share/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ email: 'shr_rec@t.com', permission: 'edit' });
+              expect(res.status).toBe(200);
+              expect(res.body.sharedWith[0].user.email).toBe('shr_rec@t.com');
+              expect(res.body.sharedWith[0].permission).toBe('edit');
+            });
+
+            it('shared user can now access the document', async () => {
+              const owner = await createUser({ email: 'acc_own@t.com' });
+              const recipient = await createUser({ email: 'acc_rec@t.com' });
+              const doc = await createDoc(tokenFor(owner._id));
+              await request(app)
+                .post(`/api/share/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ email: 'acc_rec@t.com', permission: 'view' });
+              const res = await request(app)
+                .get(`/api/documents/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(recipient._id)}`);
+              expect(res.status).toBe(200);
+            });
+
+            it('cannot share with yourself', async () => {
+              const owner = await createUser({ email: 'self@t.com' });
+              const doc = await createDoc(tokenFor(owner._id));
+              const res = await request(app)
+                .post(`/api/share/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ email: 'self@t.com', permission: 'edit' });
+              expect(res.status).toBe(400);
+            });
+
+            it('non-owner cannot share', async () => {
+              const owner = await createUser({ email: 'nshr_own@t.com' });
+              const other = await createUser({ email: 'nshr_oth@t.com' });
+              const victim = await createUser({ email: 'nshr_vic@t.com' });
+              const doc = await createDoc(tokenFor(owner._id));
+              const res = await request(app)
+                .post(`/api/share/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(other._id)}`)
+                .send({ email: 'nshr_vic@t.com', permission: 'view' });
+              expect(res.status).toBe(403);
+            });
+
+            it('returns 404 for unknown user email', async () => {
+              const owner = await createUser({ email: 'unk_own@t.com' });
+              const doc = await createDoc(tokenFor(owner._id));
+              const res = await request(app)
+                .post(`/api/share/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ email: 'ghost@nowhere.com', permission: 'view' });
+              expect(res.status).toBe(404);
+            });
+          });
+
+          describe('DELETE /api/share/:documentId/:userId', () => {
+            it('owner can remove user access', async () => {
+              const owner = await createUser({ email: 'rm_own@t.com' });
+              const recipient = await createUser({ email: 'rm_rec@t.com' });
+              const doc = await createDoc(tokenFor(owner._id));
+              await request(app)
+                .post(`/api/share/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`)
+                .send({ email: 'rm_rec@t.com', permission: 'view' });
+              const res = await request(app)
+                .delete(`/api/share/${doc._id}/${recipient._id}`)
+                .set('Authorization', `Bearer ${tokenFor(owner._id)}`);
+              expect(res.status).toBe(200);
+              // Recipient can no longer access
+              const check = await request(app)
+                .get(`/api/documents/${doc._id}`)
+                .set('Authorization', `Bearer ${tokenFor(recipient._id)}`);
+              expect(check.status).toBe(403);
+            });
+          });
+          EOF
+
+      - name: Write middleware + model unit tests
+        working-directory: backend
+        run: |
+          cat > __tests__/middleware.test.js << 'EOF'
+          const request = require('supertest');
+          const express = require('express');
+          const jwt = require('jsonwebtoken');
+          const { connect, closeDatabase, clearDatabase } = require('./helpers/db');
+          const { createUser } = require('./helpers/auth');
+          const { auth } = require('../middleware/auth');
+
+          const app = express();
+          app.use(express.json());
+          app.get('/protected', auth, (req, res) => res.json({ userId: req.userId }));
+
+          beforeAll(() => connect());
+          afterEach(() => clearDatabase());
+          afterAll(() => closeDatabase());
+
+          const SECRET = process.env.JWT_SECRET || 'ci_test_secret_do_not_use_in_prod';
+
+          describe('auth middleware', () => {
+            it('passes with valid token', async () => {
+              const user = await createUser();
+              const token = jwt.sign({ userId: user._id.toString() }, SECRET, { expiresIn: '1d' });
+              const res = await request(app)
+                .get('/protected')
+                .set('Authorization', `Bearer ${token}`);
+              expect(res.status).toBe(200);
+              expect(res.body.userId).toBe(user._id.toString());
+            });
+
+            it('rejects with no token', async () => {
+              const res = await request(app).get('/protected');
+              expect(res.status).toBe(401);
+            });
+
+            it('rejects with tampered token', async () => {
+              const res = await request(app)
+                .get('/protected')
+                .set('Authorization', 'Bearer totally.fake.token');
+              expect(res.status).toBe(401);
+            });
+
+            it('rejects with expired token', async () => {
+              const user = await createUser();
+              const token = jwt.sign({ userId: user._id.toString() }, SECRET, { expiresIn: '-1s' });
+              const res = await request(app)
+                .get('/protected')
+                .set('Authorization', `Bearer ${token}`);
+              expect(res.status).toBe(401);
+            });
+          });
+          EOF
+
+          cat > __tests__/models.test.js << 'EOF'
+          const { connect, closeDatabase, clearDatabase } = require('./helpers/db');
+          const User = require('../models/User');
+          const Document = require('../models/Document');
+
+          beforeAll(() => connect());
+          afterEach(() => clearDatabase());
+          afterAll(() => closeDatabase());
+
+          describe('User model', () => {
+            it('hashes password on save', async () => {
+              const user = await User.create({
+                name: 'Hash Test',
+                email: 'hash@test.com',
+                password: 'plaintext',
+              });
+              expect(user.password).not.toBe('plaintext');
+              expect(user.password.length).toBeGreaterThan(20);
+            });
+
+            it('comparePassword returns true for correct password', async () => {
+              const user = await User.create({
+                name: 'Comp Test',
+                email: 'comp@test.com',
+                password: 'mypassword',
+              });
+              const match = await user.comparePassword('mypassword');
+              expect(match).toBe(true);
+            });
+
+            it('comparePassword returns false for wrong password', async () => {
+              const user = await User.create({
+                name: 'Wrong',
+                email: 'wrong@test.com',
+                password: 'correct',
+              });
+              const match = await user.comparePassword('wrong');
+              expect(match).toBe(false);
+            });
+
+            it('enforces unique email', async () => {
+              await User.create({ name: 'A', email: 'dup@test.com', password: 'pass123' });
+              await expect(
+                User.create({ name: 'B', email: 'dup@test.com', password: 'pass456' })
+              ).rejects.toThrow();
+            });
+          });
+
+          describe('Document model', () => {
+            it('creates document with default title', async () => {
+              const user = await User.create({ name: 'DocUser', email: 'du@test.com', password: 'p123456' });
+              const doc = await Document.create({ owner: user._id });
+              expect(doc.title).toBe('Untitled Document');
+              expect(doc.content).toBe('');
+            });
+
+            it('updates updatedAt on save', async () => {
+              const user = await User.create({ name: 'UpdUser', email: 'upd@test.com', password: 'p123456' });
+              const doc = await Document.create({ owner: user._id, title: 'Test' });
+              const before = doc.updatedAt;
+              await new Promise((r) => setTimeout(r, 10));
+              doc.title = 'Changed';
+              await doc.save();
+              expect(doc.updatedAt.getTime()).toBeGreaterThan(before.getTime());
+            });
+          });
+          EOF
+
+      - name: Write socket unit tests
+        working-directory: backend
+        run: |
+          cat > __tests__/socket.test.js << 'EOF'
+          const http = require('http');
+          const { Server } = require('socket.io');
+          const { io: ioClient } = require('socket.io-client');
+          const jwt = require('jsonwebtoken');
+          const { connect, closeDatabase, clearDatabase } = require('./helpers/db');
+          const { createUser } = require('./helpers/auth');
+          const documentSocket = require('../socket/documentSocket');
+          const Document = require('../models/Document');
+
+          const SECRET = process.env.JWT_SECRET || 'ci_test_secret_do_not_use_in_prod';
+
+          let httpServer, ioServer, port;
+
+          function makeClient(p) {
+            return ioClient(`http://localhost:${p}`, { autoConnect: false, transports: ['websocket'] });
+          }
+
+          beforeAll(async () => {
+            await connect();
+            httpServer = http.createServer();
+            ioServer = new Server(httpServer, { cors: { origin: '*' } });
+            documentSocket(ioServer);
+            await new Promise((res) => httpServer.listen(0, res));
+            port = httpServer.address().port;
+          });
+
+          afterEach(() => clearDatabase());
+
+          afterAll(async () => {
+            ioServer.close();
+            await new Promise((res) => httpServer.close(res));
+            await closeDatabase();
+          });
+
+          function connectAndAuth(client, token) {
+            return new Promise((resolve, reject) => {
+              client.connect();
+              client.on('connect', () => client.emit('authenticate', token));
+              client.on('authenticated', ({ success }) => {
+                if (success) resolve();
+                else reject(new Error('Auth failed'));
+              });
+              client.on('connect_error', reject);
+            });
+          }
+
+          describe('Socket authentication', () => {
+            it('authenticates with valid JWT', async () => {
+              const user = await createUser();
+              const token = jwt.sign({ userId: user._id.toString() }, SECRET, { expiresIn: '1d' });
+              const client = makeClient(port);
+              await expect(connectAndAuth(client, token)).resolves.toBeUndefined();
+              client.disconnect();
+            });
+
+            it('rejects invalid JWT and disconnects', async () => {
+              const client = makeClient(port);
+              const result = await new Promise((resolve) => {
+                client.connect();
+                client.on('connect', () => client.emit('authenticate', 'bad.token'));
+                client.on('authenticated', ({ success }) => resolve(success));
+              });
+              expect(result).toBe(false);
+              client.disconnect();
+            });
+          });
+
+          describe('Socket join-document', () => {
+            it('owner receives load-document after joining', async () => {
+              const user = await createUser();
+              const doc = await Document.create({ owner: user._id, title: 'Socket Doc', content: '<p>hi</p>' });
+              const token = jwt.sign({ userId: user._id.toString() }, SECRET, { expiresIn: '1d' });
+              const client = makeClient(port);
+              const payload = await new Promise((resolve, reject) => {
+                client.connect();
+                client.on('connect', () => client.emit('authenticate', token));
+                client.on('authenticated', () => client.emit('join-document', { documentId: doc._id.toString() }));
+                client.on('load-document', resolve);
+                client.on('error', reject);
+                setTimeout(() => reject(new Error('timeout')), 5000);
+              });
+              expect(payload.content).toBe('<p>hi</p>');
+              expect(payload.title).toBe('Socket Doc');
+              client.disconnect();
+            });
+
+            it('cursor-position is forwarded to other clients', async () => {
+              const userA = await createUser({ email: 'cur_a@t.com' });
+              const userB = await createUser({ email: 'cur_b@t.com' });
+              const doc = await Document.create({ owner: userA._id, title: 'Cursor Doc', sharedWith: [{ user: userB._id, permission: 'edit' }] });
+
+              const tokenA = jwt.sign({ userId: userA._id.toString() }, SECRET, { expiresIn: '1d' });
+              const tokenB = jwt.sign({ userId: userB._id.toString() }, SECRET, { expiresIn: '1d' });
+
+              const clientA = makeClient(port);
+              const clientB = makeClient(port);
+
+              const docId = doc._id.toString();
+
+              await new Promise((res) => {
+                clientA.connect();
+                clientA.on('connect', () => clientA.emit('authenticate', tokenA));
+                clientA.on('authenticated', () => clientA.emit('join-document', { documentId: docId }));
+                clientA.on('load-document', res);
+              });
+
+              await new Promise((res) => {
+                clientB.connect();
+                clientB.on('connect', () => clientB.emit('authenticate', tokenB));
+                clientB.on('authenticated', () => clientB.emit('join-document', { documentId: docId }));
+                clientB.on('load-document', res);
+              });
+
+              const cursorUpdate = await new Promise((resolve, reject) => {
+                clientA.on('cursor-update', resolve);
+                clientB.emit('cursor-position', { documentId: docId, position: { from: 5, to: 5 } });
+                setTimeout(() => reject(new Error('cursor timeout')), 3000);
+              });
+
+              expect(cursorUpdate.position).toEqual({ from: 5, to: 5 });
+              expect(cursorUpdate.userId).toBe(userB._id.toString());
+
+              clientA.disconnect();
+              clientB.disconnect();
+            });
+          });
+          EOF
+
+      - name: Run Jest with coverage
+        working-directory: backend
+        env:
+          JWT_SECRET: ${{ env.JWT_SECRET }}
+          NODE_ENV: test
+        run: |
+          npx jest --config jest.config.cjs --coverage --runInBand 2>&1
+
+      - name: Upload backend coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: backend/coverage/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Frontend unit tests (Vitest + React Testing Library)
+  # ───────────────────────────────────────────────────────────────────────────
+  frontend-tests:
+    name: 🧪 Frontend — Vitest (unit + component)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps + test tooling
+        working-directory: frontend
+        run: |
+          npm ci
+          npm install --save-dev \
+            vitest \
+            @vitest/coverage-v8 \
+            @testing-library/react \
+            @testing-library/user-event \
+            @testing-library/jest-dom \
+            jsdom \
+            msw@2 \
+            @mswjs/interceptors
+
+      - name: Write vitest config
+        working-directory: frontend
+        run: |
+          cat > vitest.config.js << 'EOF'
+          import { defineConfig } from 'vitest/config';
+          import react from '@vitejs/plugin-react';
+
+          export default defineConfig({
+            plugins: [react()],
+            test: {
+              globals: true,
+              environment: 'jsdom',
+              setupFiles: ['./src/__tests__/setup.js'],
+              coverage: {
+                provider: 'v8',
+                reporter: ['text', 'lcov'],
+                include: ['src/**/*.{js,jsx}'],
+                exclude: ['src/main.jsx', 'src/**/__tests__/**'],
+              },
+            },
+          });
+          EOF
+
+      - name: Write test setup + mocks
+        working-directory: frontend
+        run: |
+          mkdir -p src/__tests__/mocks
+          cat > src/__tests__/setup.js << 'EOF'
+          import '@testing-library/jest-dom';
+          import { vi } from 'vitest';
+
+          // Mock socket service globally so tests never touch the network
+          vi.mock('../services/socket', () => ({
+            default: {
+              socket: { connected: false },
+              connect: vi.fn(),
+              emit: vi.fn(),
+              on: vi.fn(),
+              off: vi.fn(),
+              joinDocument: vi.fn(),
+              leaveDocument: vi.fn(),
+              sendChanges: vi.fn(),
+              sendCursorPosition: vi.fn(),
+              sendTitleChange: vi.fn(),
+            },
+          }));
+
+          // Suppress noisy console.error in tests
+          vi.spyOn(console, 'error').mockImplementation(() => {});
+          vi.spyOn(console, 'warn').mockImplementation(() => {});
+          EOF
+
+          cat > src/__tests__/mocks/handlers.js << 'EOF'
+          import { http, HttpResponse } from 'msw';
+
+          const BASE = 'http://localhost:5000/api';
+
+          export const handlers = [
+            http.post(`${BASE}/auth/login`, async ({ request }) => {
+              const body = await request.json();
+              if (body.email === 'test@example.com' && body.password === 'password123') {
+                return HttpResponse.json({
+                  token: 'mock-jwt-token',
+                  user: { id: 'user1', name: 'Test User', email: 'test@example.com' },
+                });
+              }
+              return HttpResponse.json({ message: 'Invalid credentials' }, { status: 400 });
+            }),
+
+            http.post(`${BASE}/auth/register`, async ({ request }) => {
+              const body = await request.json();
+              return HttpResponse.json(
+                {
+                  token: 'mock-jwt-token',
+                  user: { id: 'newuser', name: body.name, email: body.email },
+                },
+                { status: 201 }
+              );
+            }),
+
+            http.get(`${BASE}/auth/me`, () =>
+              HttpResponse.json({ user: { id: 'user1', name: 'Test User', email: 'test@example.com' } })
+            ),
+
+            http.get(`${BASE}/documents`, () =>
+              HttpResponse.json({
+                documents: [
+                  { _id: 'doc1', title: 'Doc One', owner: { _id: 'user1', name: 'Test User' }, updatedAt: new Date().toISOString() },
+                  { _id: 'doc2', title: 'Doc Two', owner: { _id: 'user1', name: 'Test User' }, updatedAt: new Date().toISOString() },
+                ],
+              })
+            ),
+
+            http.get(`${BASE}/documents/:id`, ({ params }) =>
+              HttpResponse.json({
+                document: {
+                  _id: params.id,
+                  title: 'Test Document',
+                  content: '<p>Hello world</p>',
+                  owner: { _id: 'user1', name: 'Test User', email: 'test@example.com' },
+                  sharedWith: [],
+                },
+              })
+            ),
+
+            http.post(`${BASE}/documents`, async ({ request }) => {
+              const body = await request.json();
+              return HttpResponse.json(
+                {
+                  document: {
+                    _id: 'newdoc',
+                    title: body.title || 'Untitled Document',
+                    owner: { _id: 'user1', name: 'Test User' },
+                    content: '',
+                    sharedWith: [],
+                  },
+                },
+                { status: 201 }
+              );
+            }),
+          ];
+          EOF
+
+      - name: Write utility unit tests
+        working-directory: frontend
+        run: |
+          cat > src/__tests__/utils.test.js << 'EOF'
+          import { describe, it, expect } from 'vitest';
+          import { getInitials, formatDate, truncateText, getToken, setToken, removeToken } from '../utils/helpers';
+
+          describe('getInitials', () => {
+            it('returns initials for full name', () => expect(getInitials('Alice Bob')).toBe('AB'));
+            it('returns single initial for one word', () => expect(getInitials('Alice')).toBe('A'));
+            it('returns ? for empty/null', () => {
+              expect(getInitials('')).toBe('?');
+              expect(getInitials(null)).toBe('?');
+            });
+            it('caps at 2 characters', () => expect(getInitials('Alice Bob Carol').length).toBeLessThanOrEqual(2));
+          });
+
+          describe('truncateText', () => {
+            it('truncates long text', () => {
+              const result = truncateText('hello world', 5);
+              expect(result).toBe('hello...');
+            });
+            it('does not truncate short text', () => {
+              expect(truncateText('hi', 50)).toBe('hi');
+            });
+            it('handles null/empty', () => {
+              expect(truncateText('')).toBe('');
+              expect(truncateText(null)).toBe('');
+            });
+          });
+
+          describe('formatDate', () => {
+            it('returns empty string for null', () => expect(formatDate(null)).toBe(''));
+            it('returns a string for a valid date', () => {
+              const result = formatDate(new Date().toISOString());
+              expect(typeof result).toBe('string');
+              expect(result.length).toBeGreaterThan(0);
+            });
+          });
+
+          describe('token helpers', () => {
+            beforeEach(() => localStorage.clear());
+
+            it('setToken stores token', () => {
+              setToken('abc123');
+              expect(localStorage.getItem('token')).toBe('abc123');
+            });
+
+            it('getToken retrieves token', () => {
+              localStorage.setItem('token', 'xyz');
+              expect(getToken()).toBe('xyz');
+            });
+
+            it('removeToken clears token', () => {
+              localStorage.setItem('token', 'todelete');
+              removeToken();
+              expect(localStorage.getItem('token')).toBeNull();
+            });
+          });
+          EOF
+
+      - name: Write component tests
+        working-directory: frontend
+        run: |
+          cat > src/__tests__/components.test.jsx << 'EOF'
+          import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
+          import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+          import userEvent from '@testing-library/user-event';
+          import { setupServer } from 'msw/node';
+          import { handlers } from './mocks/handlers';
+          import ActiveUsers from '../components/document/ActiveUsers';
+          import Loading from '../components/common/Loading';
+          import Button from '../components/common/Button';
+
+          const server = setupServer(...handlers);
+          beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
+          afterEach(() => server.resetHandlers());
+          afterAll(() => server.close());
+
+          // ── ActiveUsers ──────────────────────────────────────────────────
+          describe('ActiveUsers', () => {
+            const users = [
+              { id: 'u1', name: 'Alice Smith', email: 'alice@t.com' },
+              { id: 'u2', name: 'Bob Jones', email: 'bob@t.com' },
+            ];
+
+            it('renders nothing when no users', () => {
+              const { container } = render(<ActiveUsers users={[]} />);
+              expect(container.firstChild).toBeNull();
+            });
+
+            it('shows user initials', () => {
+              render(<ActiveUsers users={users} />);
+              expect(screen.getByTitle('Alice Smith')).toBeInTheDocument();
+              expect(screen.getByTitle('Bob Jones')).toBeInTheDocument();
+            });
+
+            it('shows correct count for 1 user', () => {
+              render(<ActiveUsers users={[users[0]]} />);
+              expect(screen.getByText('1 other person')).toBeInTheDocument();
+            });
+
+            it('shows correct count for multiple users', () => {
+              render(<ActiveUsers users={users} />);
+              expect(screen.getByText('2 others')).toBeInTheDocument();
+            });
+
+            it('uses cursor color when available', () => {
+              const cursors = { u1: { color: '#ff0000' } };
+              render(<ActiveUsers users={[users[0]]} cursors={cursors} />);
+              const avatar = screen.getByTitle('Alice Smith');
+              expect(avatar.style.backgroundColor).toBe('rgb(255, 0, 0)');
+            });
+
+            it('falls back to default color when no cursor', () => {
+              render(<ActiveUsers users={[users[0]]} cursors={{}} />);
+              const avatar = screen.getByTitle('Alice Smith');
+              expect(avatar.style.backgroundColor).toBeTruthy();
+            });
+          });
+
+          // ── Loading ──────────────────────────────────────────────────────
+          describe('Loading', () => {
+            it('renders a loading indicator', () => {
+              const { container } = render(<Loading />);
+              expect(container.firstChild).toBeTruthy();
+            });
+          });
+
+          // ── Button ───────────────────────────────────────────────────────
+          describe('Button', () => {
+            it('renders children', () => {
+              render(<Button>Click me</Button>);
+              expect(screen.getByText('Click me')).toBeInTheDocument();
+            });
+
+            it('calls onClick when clicked', async () => {
+              const handler = vi.fn();
+              render(<Button onClick={handler}>Go</Button>);
+              await userEvent.click(screen.getByText('Go'));
+              expect(handler).toHaveBeenCalledTimes(1);
+            });
+
+            it('is disabled when disabled prop set', () => {
+              render(<Button disabled>Disabled</Button>);
+              expect(screen.getByText('Disabled').closest('button')).toBeDisabled();
+            });
+          });
+          EOF
+
+      - name: Write hooks tests
+        working-directory: frontend
+        run: |
+          cat > src/__tests__/hooks.test.jsx << 'EOF'
+          import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+          import { renderHook, waitFor } from '@testing-library/react';
+          import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+          import { setupServer } from 'msw/node';
+          import { http, HttpResponse } from 'msw';
+          import { useDocuments } from '../hooks/useDocuments';
+
+          const server = setupServer(
+            http.get('http://localhost:5000/api/documents', () =>
+              HttpResponse.json({
+                documents: [
+                  { _id: 'd1', title: 'Hook Doc', owner: { _id: 'u1', name: 'User' }, updatedAt: new Date().toISOString() },
+                ],
+              })
+            )
+          );
+
+          beforeAll(() => server.listen());
+          afterEach(() => server.resetHandlers());
+          afterAll(() => server.close());
+
+          function makeWrapper() {
+            const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+            return ({ children }) => (
+              <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+            );
+          }
+
+          describe('useDocuments', () => {
+            it('fetches and returns documents', async () => {
+              const { result } = renderHook(() => useDocuments(), { wrapper: makeWrapper() });
+              await waitFor(() => expect(result.current.isSuccess).toBe(true));
+              expect(result.current.data).toHaveLength(1);
+              expect(result.current.data[0].title).toBe('Hook Doc');
+            });
+
+            it('returns loading state initially', () => {
+              const { result } = renderHook(() => useDocuments(), { wrapper: makeWrapper() });
+              expect(result.current.isLoading).toBe(true);
+            });
+
+            it('handles server errors gracefully', async () => {
+              server.use(
+                http.get('http://localhost:5000/api/documents', () =>
+                  HttpResponse.json({ message: 'Server error' }, { status: 500 })
+                )
+              );
+              const { result } = renderHook(() => useDocuments(), { wrapper: makeWrapper() });
+              await waitFor(() => expect(result.current.isError).toBe(true));
+            });
+          });
+          EOF
+
+      - name: Run Vitest with coverage
+        working-directory: frontend
+        env:
+          VITE_API_URL: http://localhost:5000
+        run: |
+          npx vitest run --coverage 2>&1
+
+      - name: Upload frontend coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 4 — Frontend build check
+  # ───────────────────────────────────────────────────────────────────────────
+  build-check:
+    name: 🏗️ Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Vite build
+        working-directory: frontend
+        env:
+          VITE_API_URL: http://localhost:5000
+          VITE_SOCKET_URL: http://localhost:5000
+          VITE_GRAPHQL_URL: http://localhost:5000/graphql
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 5 — Playwright E2E tests
+  # Needs: build-check (for the built frontend), and both test jobs to pass
+  # ───────────────────────────────────────────────────────────────────────────
+  e2e:
+    name: 🎭 Playwright E2E
+    runs-on: ubuntu-latest
+    needs: [lint, backend-tests, frontend-tests, build-check]
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Download built frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Install backend deps
+        working-directory: backend
+        run: npm ci
+
+      - name: Install frontend deps (for Playwright)
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright + browsers
+        working-directory: frontend
+        run: |
+          npm install --save-dev @playwright/test
+          npx playwright install --with-deps chromium firefox
+
+      - name: Write playwright.config.js
+        working-directory: frontend
+        run: |
+          cat > playwright.config.js << 'EOF'
+          import { defineConfig, devices } from '@playwright/test';
+
+          export default defineConfig({
+            testDir: './e2e',
+            fullyParallel: false,
+            retries: process.env.CI ? 2 : 0,
+            workers: 1,
+            reporter: [['html', { open: 'never' }], ['github']],
+            use: {
+              baseURL: 'http://localhost:4173',
+              trace: 'on-first-retry',
+              screenshot: 'only-on-failure',
+              video: 'on-first-retry',
+            },
+            projects: [
+              { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+              { name: 'firefox',  use: { ...devices['Desktop Firefox'] } },
+            ],
+            globalSetup: './e2e/global-setup.js',
+          });
+          EOF
+
+      - name: Write E2E global setup (seed test user)
+        working-directory: frontend
+        run: |
+          mkdir -p e2e
+          cat > e2e/global-setup.js << 'EOF'
+          import mongoose from 'mongoose';
+          import bcrypt from 'bcryptjs';
+
+          export default async function globalSetup() {
+            await mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/synetra_test');
+
+            // Create schema inline since we can't import from backend directly
+            const userSchema = new mongoose.Schema({
+              name: String,
+              email: { type: String, unique: true },
+              password: String,
+              avatar: { type: String, default: '' },
+            });
+            const User = mongoose.models.User || mongoose.model('User', userSchema);
+
+            await User.deleteMany({ email: { $in: ['e2e@synetra.test', 'e2e2@synetra.test'] } });
+
+            const hash = await bcrypt.hash('TestPass123!', 10);
+            await User.create([
+              { name: 'E2E User One', email: 'e2e@synetra.test', password: hash },
+              { name: 'E2E User Two', email: 'e2e2@synetra.test', password: hash },
+            ]);
+
+            await mongoose.disconnect();
+          }
+          EOF
+
+      - name: Write E2E test suites
+        working-directory: frontend
+        run: |
+          # ── Auth tests ────────────────────────────────────────────────────
+          cat > e2e/auth.spec.js << 'EOF'
+          import { test, expect } from '@playwright/test';
+
+          test.describe('Authentication', () => {
+            test('login page renders correctly', async ({ page }) => {
+              await page.goto('/login');
+              await expect(page.getByRole('heading', { name: /sign in|login/i })).toBeVisible();
+              await expect(page.getByLabel(/email/i)).toBeVisible();
+              await expect(page.getByLabel(/password/i)).toBeVisible();
+            });
+
+            test('login with valid credentials redirects to home', async ({ page }) => {
+              await page.goto('/login');
+              await page.getByLabel(/email/i).fill('e2e@synetra.test');
+              await page.getByLabel(/password/i).fill('TestPass123!');
+              await page.getByRole('button', { name: /sign in|login/i }).click();
+              await expect(page).toHaveURL(/\/$/, { timeout: 10000 });
+            });
+
+            test('login with wrong password shows error', async ({ page }) => {
+              await page.goto('/login');
+              await page.getByLabel(/email/i).fill('e2e@synetra.test');
+              await page.getByLabel(/password/i).fill('wrongpassword');
+              await page.getByRole('button', { name: /sign in|login/i }).click();
+              await expect(page.getByText(/invalid credentials/i)).toBeVisible({ timeout: 5000 });
+            });
+
+            test('register page renders correctly', async ({ page }) => {
+              await page.goto('/register');
+              await expect(page.getByLabel(/name/i)).toBeVisible();
+              await expect(page.getByLabel(/email/i)).toBeVisible();
+              await expect(page.getByLabel(/password/i).first()).toBeVisible();
+            });
+
+            test('unauthenticated user is redirected to login', async ({ page }) => {
+              await page.goto('/');
+              await expect(page).toHaveURL(/\/login/, { timeout: 5000 });
+            });
+
+            test('logout works', async ({ page }) => {
+              // Login first
+              await page.goto('/login');
+              await page.getByLabel(/email/i).fill('e2e@synetra.test');
+              await page.getByLabel(/password/i).fill('TestPass123!');
+              await page.getByRole('button', { name: /sign in|login/i }).click();
+              await page.waitForURL(/\/$/, { timeout: 10000 });
+
+              // Logout
+              await page.getByRole('button', { name: /logout|sign out/i }).click();
+              await expect(page).toHaveURL(/\/login/, { timeout: 5000 });
+            });
+          });
+          EOF
+
+          # ── Document tests ────────────────────────────────────────────────
+          cat > e2e/documents.spec.js << 'EOF'
+          import { test, expect } from '@playwright/test';
+
+          test.use({ storageState: undefined });
+
+          async function login(page, email = 'e2e@synetra.test', password = 'TestPass123!') {
+            await page.goto('/login');
+            await page.getByLabel(/email/i).fill(email);
+            await page.getByLabel(/password/i).fill(password);
+            await page.getByRole('button', { name: /sign in|login/i }).click();
+            await page.waitForURL(/\/$/, { timeout: 10000 });
+          }
+
+          test.describe('Document management', () => {
+            test.beforeEach(async ({ page }) => {
+              await login(page);
+            });
+
+            test('home page shows document list or empty state', async ({ page }) => {
+              const hasDocs = await page.getByText(/new document|create|your documents/i).count();
+              expect(hasDocs).toBeGreaterThan(0);
+            });
+
+            test('can create a new document', async ({ page }) => {
+              await page.getByRole('button', { name: /new document|create/i }).click();
+              await page.waitForURL(/\/document\//, { timeout: 10000 });
+              await expect(page).toHaveURL(/\/document\//);
+            });
+
+            test('new document opens editor', async ({ page }) => {
+              await page.getByRole('button', { name: /new document|create/i }).click();
+              await page.waitForURL(/\/document\//, { timeout: 10000 });
+              // Editor should be present (tiptap renders a .ProseMirror div)
+              await expect(page.locator('.ProseMirror')).toBeVisible({ timeout: 8000 });
+            });
+
+            test('can type in the editor', async ({ page }) => {
+              await page.getByRole('button', { name: /new document|create/i }).click();
+              await page.waitForURL(/\/document\//, { timeout: 10000 });
+              const editor = page.locator('.ProseMirror');
+              await editor.waitFor({ state: 'visible', timeout: 8000 });
+              await editor.click();
+              await page.keyboard.type('Hello Synetra');
+              await expect(editor).toContainText('Hello Synetra');
+            });
+
+            test('document title is editable', async ({ page }) => {
+              await page.getByRole('button', { name: /new document|create/i }).click();
+              await page.waitForURL(/\/document\//, { timeout: 10000 });
+              const titleInput = page.getByPlaceholder(/untitled document/i);
+              await titleInput.waitFor({ state: 'visible', timeout: 8000 });
+              await titleInput.triple_click?.() || await titleInput.click({ clickCount: 3 });
+              await page.keyboard.type('My E2E Document');
+              await page.keyboard.press('Tab');
+              await expect(titleInput).toHaveValue('My E2E Document');
+            });
+
+            test('back button navigates to home', async ({ page }) => {
+              await page.getByRole('button', { name: /new document|create/i }).click();
+              await page.waitForURL(/\/document\//, { timeout: 10000 });
+              await page.locator('[data-testid="back-button"], button[aria-label*="back"], a[href="/"]').first().click();
+              await expect(page).toHaveURL(/\/$/, { timeout: 5000 });
+            });
+          });
+          EOF
+
+          # ── Collaboration (presence) tests ────────────────────────────────
+          cat > e2e/collaboration.spec.js << 'EOF'
+          import { test, expect, chromium } from '@playwright/test';
+
+          // Test real-time collaboration: two users in the same document
+          test.describe('Real-time collaboration', () => {
+            test('two users see each other in active users bar', async ({ browser }) => {
+              // User A context
+              const ctxA = await browser.newContext();
+              const pageA = await ctxA.newPage();
+
+              // Login as User A
+              await pageA.goto('/login');
+              await pageA.getByLabel(/email/i).fill('e2e@synetra.test');
+              await pageA.getByLabel(/password/i).fill('TestPass123!');
+              await pageA.getByRole('button', { name: /sign in|login/i }).click();
+              await pageA.waitForURL(/\/$/, { timeout: 10000 });
+
+              // User A creates a document
+              await pageA.getByRole('button', { name: /new document|create/i }).click();
+              await pageA.waitForURL(/\/document\//, { timeout: 10000 });
+              const docUrl = pageA.url();
+
+              // User B context
+              const ctxB = await browser.newContext();
+              const pageB = await ctxB.newPage();
+              await pageB.goto('/login');
+              await pageB.getByLabel(/email/i).fill('e2e2@synetra.test');
+              await pageB.getByLabel(/password/i).fill('TestPass123!');
+              await pageB.getByRole('button', { name: /sign in|login/i }).click();
+              await pageB.waitForURL(/\/$/, { timeout: 10000 });
+
+              // First: User A shares the doc with User B via API so B has access
+              const docId = docUrl.split('/document/')[1];
+              const loginRes = await pageA.evaluate(async () => {
+                return localStorage.getItem('token');
+              });
+
+              // Use the backend API directly to share
+              await pageA.evaluate(async ({ docId, token }) => {
+                await fetch(`http://localhost:5000/api/share/${docId}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({ email: 'e2e2@synetra.test', permission: 'edit' }),
+                });
+              }, { docId, token: loginRes });
+
+              // User B navigates to the same document
+              await pageB.goto(docUrl);
+              await pageB.locator('.ProseMirror').waitFor({ state: 'visible', timeout: 10000 });
+
+              // User A should see User B in the active users bar
+              await expect(pageA.getByText(/E2E User Two|e2e2/i)).toBeVisible({ timeout: 8000 });
+
+              await ctxA.close();
+              await ctxB.close();
+            });
+
+            test('typing by one user is visible to the other', async ({ browser }) => {
+              const ctxA = await browser.newContext();
+              const ctxB = await browser.newContext();
+              const pageA = await ctxA.newPage();
+              const pageB = await ctxB.newPage();
+
+              // Login both
+              for (const [page, email] of [[pageA, 'e2e@synetra.test'], [pageB, 'e2e2@synetra.test']]) {
+                await page.goto('/login');
+                await page.getByLabel(/email/i).fill(email);
+                await page.getByLabel(/password/i).fill('TestPass123!');
+                await page.getByRole('button', { name: /sign in|login/i }).click();
+                await page.waitForURL(/\/$/, { timeout: 10000 });
+              }
+
+              // A creates doc
+              await pageA.getByRole('button', { name: /new document|create/i }).click();
+              await pageA.waitForURL(/\/document\//, { timeout: 10000 });
+              const docUrl = pageA.url();
+              const docId = docUrl.split('/document/')[1];
+              const token = await pageA.evaluate(() => localStorage.getItem('token'));
+
+              // Share with B
+              await pageA.evaluate(async ({ docId, token }) => {
+                await fetch(`http://localhost:5000/api/share/${docId}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({ email: 'e2e2@synetra.test', permission: 'edit' }),
+                });
+              }, { docId, token });
+
+              // B joins
+              await pageB.goto(docUrl);
+              await pageB.locator('.ProseMirror').waitFor({ state: 'visible', timeout: 10000 });
+
+              // A types
+              const editorA = pageA.locator('.ProseMirror');
+              await editorA.click();
+              await pageA.keyboard.type('Collaborative text');
+
+              // B should see the text
+              await expect(pageB.locator('.ProseMirror')).toContainText('Collaborative text', { timeout: 8000 });
+
+              await ctxA.close();
+              await ctxB.close();
+            });
+          });
+          EOF
+
+      - name: Start backend server
+        working-directory: backend
+        env:
+          MONGO_URI: ${{ env.MONGO_URI }}
+          JWT_SECRET: ${{ env.JWT_SECRET }}
+          PORT: ${{ env.PORT }}
+          CLIENT_URL: ${{ env.CLIENT_URL }}
+          NODE_ENV: test
+        run: |
+          node server.js &
+          echo "BACKEND_PID=$!" >> $GITHUB_ENV
+          # Wait for server to be ready
+          timeout 30 bash -c 'until curl -sf http://localhost:5000/health; do sleep 1; done'
+
+      - name: Serve built frontend
+        working-directory: frontend
+        run: |
+          npx vite preview --port 4173 --host &
+          echo "FRONTEND_PID=$!" >> $GITHUB_ENV
+          timeout 20 bash -c 'until curl -sf http://localhost:4173; do sleep 1; done'
+
+      - name: Run Playwright tests
+        working-directory: frontend
+        env:
+          MONGO_URI: ${{ env.MONGO_URI }}
+          CI: true
+        run: npx playwright test --reporter=github,html
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 14
+
+      - name: Upload Playwright traces / screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-traces
+          path: frontend/test-results/
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 6 — Final summary gate
+  # ───────────────────────────────────────────────────────────────────────────
+  all-checks-pass:
+    name: ✅ All checks passed
+    runs-on: ubuntu-latest
+    needs: [lint, backend-tests, frontend-tests, build-check, e2e]
+    if: always()
+    steps:
+      - name: Check all jobs succeeded
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results" | python3 -c "
+          import sys, json
+          needs = json.load(sys.stdin)
+          failed = [k for k, v in needs.items() if v['result'] not in ('success', 'skipped')]
+          if failed:
+              print('FAILED jobs:', ', '.join(failed))
+              sys.exit(1)
+          print('All jobs passed!')
+          "
