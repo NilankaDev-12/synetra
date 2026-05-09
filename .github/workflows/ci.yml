@@ -875,9 +875,7 @@ jobs:
             @testing-library/react \
             @testing-library/user-event \
             @testing-library/jest-dom \
-            jsdom \
-            msw@2 \
-            @mswjs/interceptors
+            jsdom
 
       - name: Write vitest config
         working-directory: frontend
@@ -892,6 +890,11 @@ jobs:
               globals: true,
               environment: 'jsdom',
               setupFiles: ['./src/__tests__/setup.js'],
+              env: {
+                VITE_API_URL: 'http://localhost:5000',
+                VITE_SOCKET_URL: 'http://localhost:5000',
+                VITE_GRAPHQL_URL: 'http://localhost:5000/graphql',
+              },
               coverage: {
                 provider: 'v8',
                 reporter: ['text', 'lcov'],
@@ -925,6 +928,12 @@ jobs:
               sendTitleChange: vi.fn(),
             },
           }));
+
+          // Prevent jsdom "Not implemented: navigation" from axios 401 interceptor
+          Object.defineProperty(window, 'location', {
+            writable: true,
+            value: { href: '', assign: vi.fn(), replace: vi.fn(), reload: vi.fn() },
+          });
 
           // Suppress noisy console.error in tests
           vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -1475,7 +1484,7 @@ jobs:
               await page.waitForURL(/\/document\//, { timeout: 10000 });
               const titleInput = page.getByPlaceholder(/untitled document/i);
               await titleInput.waitFor({ state: 'visible', timeout: 8000 });
-              await titleInput.triple_click?.() || await titleInput.click({ clickCount: 3 });
+              await titleInput.click({ clickCount: 3 });
               await page.keyboard.type('My E2E Document');
               await page.keyboard.press('Tab');
               await expect(titleInput).toHaveValue('My E2E Document');

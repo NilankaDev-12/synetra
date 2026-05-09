@@ -29,7 +29,15 @@ api.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401) {
       removeToken();
-      window.location.href = '/login';
+      // Guard against jsdom / test environments where navigation is not
+      // implemented. In a real browser this will always be defined.
+      if (typeof window !== 'undefined' && window.location) {
+        try {
+          window.location.href = '/login';
+        } catch {
+          // jsdom throws "Not implemented: navigation" — safe to swallow in tests
+        }
+      }
     }
     return Promise.reject(error);
   }
